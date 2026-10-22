@@ -7745,11 +7745,142 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     ctx->prealloc_split_k_need_sync = true;
 }
 
+// tile-rs experiment: expert-indexed Q4_K and Q6_K matvecs from shaders loaded at runtime
+// (LLAMA_TILE_MMVQ4K_SPV / LLAMA_TILE_MMVQ6K_SPV = compiled .spv). Single-token decode with an
+// f32 activation, optionally followed by the routing-weight multiply that llama.cpp fuses in.
+// Every other case returns false and the stock kernels run.
+struct ggml_vk_tile_mmv {
+    vk_pipeline pipe;
+    std::vector<uint32_t> spv;
+};
+static ggml_vk_tile_mmv ggml_vk_tile_mmv_q4k;
+static ggml_vk_tile_mmv ggml_vk_tile_mmv_q6k;
+
+// Loads the shader on first use. Returns nullptr if the variable is unset or the file is unreadable.
+static vk_pipeline ggml_vk_tile_mmv_get(ggml_backend_vk_context * ctx, ggml_vk_tile_mmv & m,
+                                        const char * env, const char * name) {
+    if (m.pipe != nullptr) {
+        return m.pipe;
+    }
+    const char * path = getenv(env);
+    if (path == nullptr) {
+        return nullptr;
+    }
+    FILE * f = fopen(path, "rb");
+    if (f == nullptr) {
+        fprintf(stderr, "tile_mmv: cannot open %s\n", path);
+        return nullptr;
+    }
+    fseek(f, 0, SEEK_END);
+    const long nbytes = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    m.spv.resize((size_t)nbytes / sizeof(uint32_t));
+    const size_t got = fread(m.spv.data(), 1, (size_t)nbytes, f);
+    fclose(f);
+    if (got != (size_t)nbytes) {
+        m.spv.clear();
+        return nullptr;
+    }
+    m.pipe = std::make_shared<vk_pipeline_struct>();
+    // ggml_vk_create_pipeline_func builds the module and layout but does not record these
+    // fields; the stock lambda does. Set them here, as that lambda would.
+    m.pipe->name = name;
+    m.pipe->parameter_count = 6;
+    m.pipe->push_constant_size = sizeof(vk_mat_vec_id_push_constants);
+    m.pipe->wg_denoms = {1, 1, 1};
+    m.pipe->align = 1;
+    m.pipe->initialized = true;
+    ggml_vk_create_pipeline_func(ctx->device, m.pipe, m.spv.size() * sizeof(uint32_t),
+                                 m.spv.data(), "main", 6, {1, 1, 1}, {}, false, false, 0);
+    return m.pipe;
+}
+
+static bool ggml_vk_tile_mmv_try(ggml_backend_vk_context * ctx, vk_context & subctx,
+                                 const ggml_cgraph * cgraph, int node_idx,
+                                 const ggml_tensor * src0, const ggml_tensor * src1,
+                                 const ggml_tensor * ids, const ggml_tensor * dst) {
+    static const bool trace = getenv("LLAMA_TILE_MMVQ4K_TRACE") != nullptr;
+    const int fused = ctx->num_additional_fused_ops;
+    if (fused > 1) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q6_K) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || dst->type != GGML_TYPE_F32 ||
+        (src1->ne[1] != 1 && src1->ne[1] != ids->ne[0]) || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        ids->ne[1] != 1 || src0->ne[0] % 256 != 0 || src0->ne[1] > 65535 ||
+        !ggml_is_contiguous(src1) || !ggml_vk_dim01_contiguous(src0)) {
+        return false;
+    }
+
+    // Fused follow-up: a single MUL by the per-slot routing weights (llama.cpp fuses the
+    // expert down projection with it). Anything else is left to the stock kernel.
+    const ggml_tensor * out = cgraph->nodes[node_idx + fused];
+    const ggml_tensor * scale = nullptr;
+    if (fused == 1) {
+        const ggml_tensor * m = cgraph->nodes[node_idx + 1];
+        if (m->op != GGML_OP_MUL || m->src[0] != dst || m->src[1] == nullptr ||
+            m->src[1]->type != GGML_TYPE_F32 || ggml_nelements(m->src[1]) != ids->ne[0] ||
+            m->type != GGML_TYPE_F32) {
+            return false;
+        }
+        scale = m->src[1];
+    }
+
+    vk_pipeline pipe = src0->type == GGML_TYPE_Q4_K
+        ? ggml_vk_tile_mmv_get(ctx, ggml_vk_tile_mmv_q4k, "LLAMA_TILE_MMVQ4K_SPV", "tile_mmvq4k")
+        : ggml_vk_tile_mmv_get(ctx, ggml_vk_tile_mmv_q6k, "LLAMA_TILE_MMVQ6K_SPV", "tile_mmvq6k");
+    if (pipe == nullptr) {
+        return false;
+    }
+    // Experimental r4 shaders (mul_mat_vec_id_q6k_r4.comp) handle four rows per workgroup.
+    const bool q6_r4 = src0->type == GGML_TYPE_Q6_K && getenv("LLAMA_TILE_MMVQ6K_R4") != nullptr;
+    if (q6_r4 && (src0->ne[1] % 4) != 0) {
+        return false;
+    }
+    if (trace) {
+        fprintf(stderr, "tile_mmv: dispatch type=%s rows=%lld experts=%lld K=%lld\n",
+                ggml_type_name(src0->type), (long long)src0->ne[1], (long long)ids->ne[0],
+                (long long)src0->ne[0]);
+    }
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipe, 1);
+
+    const vk_subbuffer d_D   = ggml_vk_tensor_subbuffer(ctx, out);
+    const vk_subbuffer d_F0  = fused == 1 ? ggml_vk_tensor_subbuffer(ctx, scale) : d_D;
+    const vk_subbuffer d_Qx  = ggml_vk_tensor_subbuffer(ctx, src0);
+    const vk_subbuffer d_Qy  = ggml_vk_tensor_subbuffer(ctx, src1);
+    const vk_subbuffer d_ids = ggml_vk_tensor_subbuffer(ctx, ids);
+
+    vk_mat_vec_id_push_constants pc = {
+        (uint32_t)src0->ne[0],                         // ncols
+        0u,                                            // stride_a (unused by the shaders)
+        (uint32_t)(src1->nb[1] / sizeof(float)),       // stride_b: one activation row
+        (uint32_t)(dst->nb[1] / sizeof(float)),        // stride_d: one output row
+        (uint32_t)src0->nb[2],                         // batch_stride_a: bytes per expert
+        (uint32_t)(src1->nb[2] / sizeof(float)),       // batch_stride_b
+        (uint32_t)(dst->nb[2] / sizeof(float)),        // batch_stride_d
+        fused == 1 ? 0x4u : 0u,                        // fusion_flags: MAT_VEC_FUSION_FLAGS_SCALE0
+        (uint32_t)ids->ne[0],                          // nei0: selected experts
+        (uint32_t)src1->ne[1],                         // ne11
+        0u,                                            // expert_i1 (decode: token 0)
+        (uint32_t)(ids->nb[1] / sizeof(int32_t)),      // nbi1
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipe,
+        { d_Qx, d_Qy, d_D, d_F0, d_D, d_ids },
+        pc, { (uint32_t)(q6_r4 ? src0->ne[1] / 4 : src0->ne[1]), (uint32_t)ids->ne[0], 1u });
+    return true;
+}
+
 static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
     ggml_tensor * ids = dst->src[2];
+    if (ggml_vk_tile_mmv_try(ctx, subctx, cgraph, node_idx, src0, src1, ids, dst)) {
+        return;
+    }
     VK_LOG_DEBUG("ggml_vk_mul_mat_vec_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << ids << ", name=" << ids->name << ", type=" << ids->type << ", ne0=" << ids->ne[0] << ", ne1=" << ids->ne[1] << ", ne2=" << ids->ne[2] << ", ne3=" << ids->ne[3] << ", nb0=" << ids->nb[0] << ", nb1=" << ids->nb[1] << ", nb2=" << ids->nb[2] << ", nb3=" << ids->nb[3];
